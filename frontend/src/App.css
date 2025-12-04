@@ -1,0 +1,187 @@
+/* -----------------------------------------
+   GLOBAL
+----------------------------------------- */
+
+body {
+  margin: 0;
+  background: #0a0f1f;
+  color: #e5e7eb;
+  font-family: "Inter", system-ui, sans-serif;
+}
+
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* -----------------------------------------
+   HERO SECTION (titre + search bar)
+----------------------------------------- */
+
+.hero-section {
+  text-align: center;
+  padding: 60px 20px 40px;
+  width: 100%;
+}
+
+.app-title {
+  font-size: 3rem;
+  font-weight: 800;
+  letter-spacing: -1px;
+  background: linear-gradient(90deg, #60a5fa, #a78bfa);
+  -webkit-background-clip: text;
+  color: transparent;
+  margin: 0;
+}
+
+.subtitle {
+  margin-top: 8px;
+  color: #9ca3af;
+  font-size: 1.1rem;
+}
+
+/* -----------------------------------------
+   SEARCH BOX centré style Google Scholar
+----------------------------------------- */
+
+.search-box {
+  margin: 30px auto 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 700px;
+}
+
+.search-box input {
+  flex: 1;
+  padding: 14px 18px;
+  border-radius: 999px;
+  border: 1px solid #334155;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 1rem;
+  transition: 0.2s;
+}
+
+.search-box input:focus {
+  border-color: #3b82f6;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.3);
+}
+
+.search-box button {
+  background: #3b82f6;
+  border: none;
+  font-size: 1.2rem;
+  padding: 14px 20px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: 0.2s;
+}
+
+.search-box button:hover {
+  background: #2563eb;
+}
+
+/* -----------------------------------------
+   SEARCH OPTIONS
+----------------------------------------- */
+
+.search-options {
+  margin-top: 8px;
+  color: #9ca3af;
+}
+
+.search-options input {
+  width: 55px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #e5e7eb;
+}
+
+/* -----------------------------------------
+   RESULTS
+----------------------------------------- */
+
+.app-main {
+  width: 100%;
+  max-width: 900px;
+  padding: 10px 20px 80px;
+}
+
+.results-title {
+  margin-bottom: 20px;
+  font-size: 1.4rem;
+}
+
+.results-title span {
+  color: #60a5fa;
+}
+
+.results-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* -----------------------------------------
+   RESULT CARD
+----------------------------------------- */
+
+.result-card {
+  padding: 18px;
+  border: 1px solid #1e293b;
+  background: #0f172a;
+  border-radius: 14px;
+  transition: 0.2s;
+}
+
+.result-card:hover {
+  border-color: #3b82f6;
+  background: #13203d;
+  transform: translateY(-2px);
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.filename {
+  margin: 8px 0 6px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.snippet {
+  font-size: 0.95rem;
+  color: #cbd5e1;
+  line-height: 1.5;
+}
+
+.no-results {
+  text-align: center;
+  color: #94a3b8;
+  margin-top: 20px;
+}
+
+/* -----------------------------------------
+   ERROR BOX
+----------------------------------------- */
+
+.error-box {
+  background: #7f1d1d;
+  color: #fee2e2;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+}
