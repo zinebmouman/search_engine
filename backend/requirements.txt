@@ -4,3 +4,12 @@ pypdf
 nltk
 pydantic
 python-multipart
+beautifulsoup4
+requests
+numpy
+rapidfuzz
+sentence-transformers
+scipy
+watchdog
+portalocker
+psutil
