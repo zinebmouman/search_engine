@@ -155,11 +155,51 @@ body {
   color: #94a3b8;
 }
 
-.filename {
+.filename-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin: 8px 0 6px;
+}
+
+.filename {
+  margin: 0;
   font-size: 1.1rem;
   font-weight: 600;
   color: #e2e8f0;
+  flex: 1;
+}
+
+.filename-link {
+  color: #60a5fa;
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.filename-link:hover {
+  color: #93c5fd;
+  text-decoration: underline;
+}
+
+.pdf-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #3b82f6;
+  color: white;
+  text-decoration: none;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background 0.2s, transform 0.2s;
+  white-space: nowrap;
+}
+
+.pdf-button:hover {
+  background: #2563eb;
+  transform: translateY(-1px);
 }
 
 .snippet {

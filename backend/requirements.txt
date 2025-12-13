@@ -4,3 +4,6 @@ pypdf
 nltk
 pydantic
 python-multipart
+numpy
+rapidfuzz
+sentence-transformers

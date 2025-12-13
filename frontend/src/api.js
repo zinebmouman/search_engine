@@ -8,9 +8,21 @@ export async function searchDocs(query, topK = 5) {
     top_k: topK.toString(),
   });
 
-  const res = await fetch(`${API_BASE_URL}/search?` + params.toString());
-  if (!res.ok) {
-    throw new Error(`Erreur API: ${res.status}`);
+  try {
+    const res = await fetch(`${API_BASE_URL}/search?` + params.toString());
+    if (!res.ok) {
+      throw new Error(`Erreur API: ${res.status} - ${res.statusText}`);
+    }
+    return await res.json();
+  } catch (error) {
+    if (
+      error.message.includes("Failed to fetch") ||
+      error.message.includes("ERR_CONNECTION_REFUSED")
+    ) {
+      throw new Error(
+        `Impossible de se connecter au serveur backend sur ${API_BASE_URL}. Vérifiez que le serveur est lancé avec: python main.py ou uvicorn main:app --reload`
+      );
+    }
+    throw error;
   }
-  return await res.json();
 }

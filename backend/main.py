@@ -1,20 +1,25 @@
 # backend/main.py
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import os
 
-from search_core import ensure_index_built, search_db
+from search_core import ensure_index_built_enhanced, search_db_enhanced, PDF_DIR
 
-# S'assure que la DB est prête au démarrage
-ensure_index_built()
+# -----------------
+# Indexation au démarrage
+# -----------------
+# force_reindex=True pour reconstruire l'index à chaque lancement (utile pour dev / nouveaux PDFs)
+ensure_index_built_enhanced(force_reindex=True, compute_embeddings=True)
 
 app = FastAPI(
-    title="Moteur de Recherche Fuzzy N-Gram",
-    description="Backend FastAPI pour ton moteur de recherche sur PDF (fuzzy n-grams + SQLite).",
-    version="1.0.0",
+    title="Moteur de Recherche Fuzzy N-Gram + Lemmatisation + BM25 + Embeddings",
+    description="Backend FastAPI pour moteur de recherche sur PDF avec fuzzy, n-grams, lemmatisation, BM25 et embeddings.",
+    version="2.0.0",
 )
 
 # CORS : autoriser le front React en local
@@ -27,11 +32,26 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # tu peux mettre ["*"] en dev
+    allow_origins=origins,  # mettre ["*"] en dev si nécessaire
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Servir les fichiers PDF statiques
+@app.get("/pdfs/{filename}")
+async def get_pdf(filename: str):
+    """
+    Endpoint pour servir les fichiers PDF.
+    """
+    pdf_path = os.path.join(PDF_DIR, filename)
+    if os.path.exists(pdf_path):
+        return FileResponse(
+            pdf_path,
+            media_type="application/pdf",
+            filename=filename
+        )
+    return {"error": "PDF not found"}
 
 
 class SearchResult(BaseModel):
@@ -39,6 +59,8 @@ class SearchResult(BaseModel):
     filename: str
     score: float
     snippet: str
+    match_terms: Optional[List[str]] = []  # ajouté pour voir quels termes ont matché
+    pdf_url: Optional[str] = None  # URL pour accéder au PDF
 
 
 @app.get("/search", response_model=List[SearchResult])
@@ -48,11 +70,20 @@ def search_endpoint(
 ):
     """
     Endpoint principal : /search?query=...&top_k=5
+    Utilise la recherche améliorée : lemmatisation, fuzzy, BM25, embeddings.
     """
-    results = search_db(query, top_k=top_k)
+    results = search_db_enhanced(query, top_k=top_k)
     return [SearchResult(**r) for r in results]
 
 
 @app.get("/")
 def root():
-    return {"message": "Moteur de recherche fuzzy n-gram opérationnel. Utilise /search?query=..."}
+    return {
+        "message": "Moteur de recherche fuzzy n-gram opérationnel. Utilise /search?query=...&top_k=5"
+    }
+
+
+# Lancer le serveur si exécuté directement
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

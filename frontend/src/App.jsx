@@ -24,7 +24,7 @@ function App() {
       setResults(data);
     } catch (err) {
       console.error(err);
-      setError("Erreur lors de la recherche (voir console).");
+      setError(err.message || "Erreur lors de la recherche (voir console).");
     } finally {
       setLoading(false);
     }
@@ -32,13 +32,10 @@ function App() {
 
   return (
     <div className="app-root">
-
       {/* ----------- TOP SECTION ----------- */}
       <div className="hero-section">
         <h1 className="app-title">SciFindr</h1>
-        <p className="subtitle">
-          AI-powered scientific PDF search engine
-        </p>
+        <p className="subtitle">AI-powered scientific PDF search engine</p>
 
         {/* SEARCH BAR CENTRÉE */}
         <form className="search-box" onSubmit={handleSearch}>
@@ -87,7 +84,33 @@ function App() {
                 <span className="score">score = {r.score.toFixed(4)}</span>
               </div>
 
-              <h3 className="filename">{r.filename}</h3>
+              <div className="filename-container">
+                {r.pdf_url ? (
+                  <>
+                    <h3 className="filename">
+                      <a 
+                        href={`http://localhost:8000${r.pdf_url}`} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="filename-link"
+                      >
+                        {r.filename}
+                      </a>
+                    </h3>
+                    <a 
+                      href={`http://localhost:8000${r.pdf_url}`} 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="pdf-button"
+                      title="Ouvrir le PDF"
+                    >
+                      📄 Ouvrir PDF
+                    </a>
+                  </>
+                ) : (
+                  <h3 className="filename">{r.filename}</h3>
+                )}
+              </div>
               <p className="snippet">{r.snippet}</p>
             </article>
           ))}
