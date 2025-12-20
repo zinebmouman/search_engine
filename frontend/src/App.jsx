@@ -1,7 +1,7 @@
 // frontend/src/App.jsx
 
 import { useState } from "react";
-import { searchDocs } from "./api";
+import { searchDocs, API_BASE_URL } from "./api";
 import "./App.css";
 
 function App() {
@@ -32,13 +32,10 @@ function App() {
 
   return (
     <div className="app-root">
-
       {/* ----------- TOP SECTION ----------- */}
       <div className="hero-section">
         <h1 className="app-title">SciFindr</h1>
-        <p className="subtitle">
-          AI-powered scientific PDF search engine
-        </p>
+        <p className="subtitle">AI-powered scientific PDF search engine</p>
 
         {/* SEARCH BAR CENTRÉE */}
         <form className="search-box" onSubmit={handleSearch}>
@@ -89,6 +86,16 @@ function App() {
 
               <h3 className="filename">{r.filename}</h3>
               <p className="snippet">{r.snippet}</p>
+              {r.pdf_url && (
+                <a
+                  className="open-doc-link"
+                  href={`${API_BASE_URL}${r.pdf_url}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  View
+                </a>
+              )}
             </article>
           ))}
 

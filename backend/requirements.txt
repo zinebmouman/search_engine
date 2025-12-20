@@ -13,3 +13,4 @@ scipy
 watchdog
 portalocker
 psutil
+matplotlib

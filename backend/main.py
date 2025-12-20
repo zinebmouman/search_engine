@@ -4,6 +4,7 @@ from typing import List, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from search_core import (
@@ -20,6 +21,15 @@ app = FastAPI(
     description="Indexation incrémentale + tracking + embeddings",
     version="3.0.0",
 )
+
+# Exposition des documents indexés (PDF / TXT / HTML)
+PDF_DIR = os.path.join(DATA_DIR, "pdfs")
+TEXT_DIR = os.path.join(DATA_DIR, "texts")
+HTML_DIR = os.path.join(DATA_DIR, "htmls")
+
+app.mount("/pdfs", StaticFiles(directory=PDF_DIR), name="pdfs")
+app.mount("/texts", StaticFiles(directory=TEXT_DIR), name="texts")
+app.mount("/htmls", StaticFiles(directory=HTML_DIR), name="htmls")
 
 origins = [
     "http://localhost:5173",
