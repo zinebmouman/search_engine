@@ -1,6 +1,7 @@
 # backend/search_core.py
 import os
 import re
+import io
 import time
 import json
 import uuid
@@ -11,10 +12,13 @@ import logging
 from datetime import datetime
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
+import unicodedata
+
+import boto3
+from botocore.client import Config
 
 import nltk
 from pypdf import PdfReader
-from bs4 import BeautifulSoup
 
 try:
     import numpy as np
@@ -35,6 +39,11 @@ except Exception:
 from nltk.util import ngrams
 from nltk.tokenize import word_tokenize
 
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
 
 # ==========================
 # 0) Paths & constants
@@ -42,25 +51,164 @@ from nltk.tokenize import word_tokenize
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-PDF_DIR = os.path.join(DATA_DIR, "pdfs")
-TEXT_DIR = os.path.join(DATA_DIR, "texts")
-HTML_DIR = os.path.join(DATA_DIR, "htmls")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 
 DB_PATH = os.path.join(DATA_DIR, "index_moteur_recherche.db")
 DEFAULT_EMBED_PATH = os.path.join(DATA_DIR, "embeddings.npz")
 
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler(os.path.join(LOG_DIR, "indexer.log"), encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("search_core")
+
+
+# ==========================
+# MinIO (S3 compatible)
+# ==========================
+
+# Interne (docker network)
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+
+# Externe (navigateur / host machine) pour presigned urls
+MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", MINIO_ENDPOINT)
+
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "documents")
+MINIO_REGION = os.getenv("MINIO_REGION", "us-east-1")
+
+_s3_internal = None
+_s3_public = None
+
+
+def to_ascii_safe(s: str) -> str:
+    """S3 metadata must be ASCII."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = s.strip()
+    return s or "file"
+
+
+def _make_s3_client(endpoint: str):
+    is_https = endpoint.lower().startswith("https://")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        region_name=MINIO_REGION,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        verify=True if is_https else False,
+    )
+
+
+def get_s3_client():
+    """Client interne: utilisé pour put/get/delete depuis backend (docker)"""
+    global _s3_internal
+    if _s3_internal is None:
+        _s3_internal = _make_s3_client(MINIO_ENDPOINT)
+    return _s3_internal
+
+
+def get_s3_public_client():
+    """Client public: utilisé uniquement pour générer presigned URLs accessibles navigateur"""
+    global _s3_public
+    if _s3_public is None:
+        _s3_public = _make_s3_client(MINIO_PUBLIC_ENDPOINT)
+    return _s3_public
+
+
+def ensure_bucket_exists(bucket: str = MINIO_BUCKET):
+    s3 = get_s3_client()
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except Exception:
+        s3.create_bucket(Bucket=bucket)
+
+
+def _detect_doc_type_from_filename(filename: str) -> str:
+    fn = (filename or "").lower()
+    if fn.endswith(".pdf"):
+        return "pdf"
+    if fn.endswith(".txt"):
+        return "txt"
+    if fn.endswith(".html") or fn.endswith(".htm"):
+        return "html"
+    return "txt"
+
+
+def _content_type_for(doc_type: str) -> str:
+    if doc_type == "pdf":
+        return "application/pdf"
+    if doc_type == "html":
+        return "text/html"
+    return "text/plain"
+
+
+def _object_key_for(doc_type: str, doc_id: str) -> str:
+    if doc_type == "pdf":
+        return f"pdfs/{doc_id}.pdf"
+    if doc_type == "html":
+        return f"htmls/{doc_id}.html"
+    return f"texts/{doc_id}.txt"
+
+
+def put_file_bytes_to_minio(
+    file_bytes: bytes,
+    original_filename: str,
+    doc_type: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    ensure_bucket_exists(MINIO_BUCKET)
+    doc_id = str(uuid.uuid4())
+    doc_type = doc_type or _detect_doc_type_from_filename(original_filename)
+    object_key = _object_key_for(doc_type, doc_id)
+
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=MINIO_BUCKET,
+        Key=object_key,
+        Body=file_bytes,
+        ContentType=_content_type_for(doc_type),
+        Metadata={"original_filename": to_ascii_safe(original_filename)[:250]},
+    )
+    return doc_id, object_key, doc_type
+
+
+def get_object_bytes(object_key: str) -> bytes:
+    s3 = get_s3_client()
+    obj = s3.get_object(Bucket=MINIO_BUCKET, Key=object_key)
+    return obj["Body"].read()
+
+
+def delete_object_from_minio(object_key: str):
+    if not object_key:
+        return
+    s3 = get_s3_client()
+    try:
+        s3.delete_object(Bucket=MINIO_BUCKET, Key=object_key)
+    except Exception:
+        pass
+
+
+def presigned_get_url(object_key: str, expires_sec: int = 900) -> str:
+    """
+    IMPORTANT: générer l'URL via le client PUBLIC,
+    sinon l'URL est signée pour "minio:9000" et devient invalide dans le navigateur.
+    """
+    s3 = get_s3_public_client()
+    return s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": MINIO_BUCKET, "Key": object_key},
+        ExpiresIn=expires_sec,
+    )
 
 
 # ==========================
@@ -71,20 +219,23 @@ def init_nltk():
     resources = ["punkt", "stopwords", "wordnet", "omw-1.4"]
     for r in resources:
         try:
-            nltk.data.find(
-                r if "/" in r else (f"tokenizers/{r}" if r == "punkt" else f"corpora/{r}")
-            )
+            if r == "punkt":
+                nltk.data.find("tokenizers/punkt")
+            else:
+                nltk.data.find(f"corpora/{r}")
         except Exception:
             try:
                 nltk.download(r, quiet=True)
             except Exception:
                 pass
 
+
 init_nltk()
 
 try:
     from nltk.corpus import stopwords, wordnet
     from nltk.stem import WordNetLemmatizer
+
     stop_words_english = set(stopwords.words("english"))
     lemmatizer = WordNetLemmatizer()
 except Exception:
@@ -101,8 +252,9 @@ except Exception:
 # 2) Embedding model (lazy)
 # ==========================
 
-_EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+_EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
 _embedding_model = None
+
 
 def get_embedding_model():
     global _embedding_model
@@ -112,11 +264,11 @@ def get_embedding_model():
 
 
 # ==========================
-# 3) SQLite helpers (WAL + busy_timeout)
+# 3) SQLite helpers
 # ==========================
 
 def connect_db(db_path: str = DB_PATH) -> sqlite3.Connection:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -125,26 +277,55 @@ def connect_db(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 
 # ==========================
-# 4) Schema (MLOps tracking)
+# 4) Schema + migrations
 # ==========================
+
+def ensure_columns_exist(db_path: str = DB_PATH):
+    conn = connect_db(db_path)
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(documents)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+
+    needed = {
+        "doc_id": "TEXT",
+        "filename": "TEXT",
+        "doc_type": "TEXT",
+        "clean_text": "TEXT",
+        "file_hash": "TEXT",
+        "file_size": "INTEGER",
+        "object_key": "TEXT",
+        "added_at": "TEXT",
+        "updated_at": "TEXT",
+    }
+
+    for col, col_type in needed.items():
+        if col not in existing_cols:
+            cur.execute(f"ALTER TABLE documents ADD COLUMN {col} {col_type}")
+
+    conn.commit()
+    conn.close()
+
 
 def init_db_enhanced(db_path: str = DB_PATH):
     conn = connect_db(db_path)
     cur = conn.cursor()
 
-    # documents table: store metadata
     cur.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             doc_id TEXT PRIMARY KEY,
-            filename TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL,
             doc_type TEXT NOT NULL,
             clean_text TEXT,
             file_hash TEXT,
             file_size INTEGER,
+            object_key TEXT,
             added_at TEXT,
             updated_at TEXT
         )
     """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_filename ON documents(filename)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS postings (
@@ -164,15 +345,14 @@ def init_db_enhanced(db_path: str = DB_PATH):
         )
     """)
 
-    # logs of updates
     cur.execute("""
         CREATE TABLE IF NOT EXISTS updates_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            action TEXT NOT NULL,          -- INSERT / UPDATE / DELETE / ERROR
+            action TEXT NOT NULL,
             filename TEXT,
             doc_id TEXT,
-            status TEXT NOT NULL,          -- OK / FAIL
+            status TEXT NOT NULL,
             duration_ms REAL,
             file_size INTEGER,
             file_hash TEXT,
@@ -185,126 +365,78 @@ def init_db_enhanced(db_path: str = DB_PATH):
 
     conn.commit()
     conn.close()
-    
     ensure_columns_exist(db_path)
 
 
-def ensure_columns_exist(db_path: str = DB_PATH):
-    """
-    Migration légère : ajoute les colonnes manquantes dans documents (sans supprimer la DB).
-    """
+def log_update(
+    action: str,
+    filename: str,
+    doc_id: Optional[str],
+    status: str,
+    duration_ms: float = 0.0,
+    file_size: Optional[int] = None,
+    file_hash: Optional[str] = None,
+    details: Optional[dict] = None,
+    db_path: str = DB_PATH,
+):
     conn = connect_db(db_path)
     cur = conn.cursor()
-
-    # Récupérer les colonnes existantes
-    cur.execute("PRAGMA table_info(documents)")
-    existing_cols = {row[1] for row in cur.fetchall()}
-
-    # Colonnes attendues
-    needed = {
-        "doc_type": "TEXT",
-        "file_hash": "TEXT",
-        "file_size": "INTEGER",
-        "added_at": "TEXT",
-        "updated_at": "TEXT",
-    }
-
-    for col, col_type in needed.items():
-        if col not in existing_cols:
-            cur.execute(f"ALTER TABLE documents ADD COLUMN {col} {col_type}")
-            conn.commit()
-
-    conn.close()
-
-
-def log_update(action: str, filename: str, doc_id: Optional[str], status: str,
-               duration_ms: float = 0.0, file_size: Optional[int] = None,
-               file_hash: Optional[str] = None, details: Optional[dict] = None,
-               db_path: str = DB_PATH):
-    conn = connect_db(db_path)
-    cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO updates_log(ts, action, filename, doc_id, status, duration_ms, file_size, file_hash, details)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        datetime.utcnow().isoformat(),
-        action,
-        filename,
-        doc_id,
-        status,
-        float(duration_ms),
-        int(file_size) if file_size is not None else None,
-        file_hash,
-        json.dumps(details or {}, ensure_ascii=False)
-    ))
+        """,
+        (
+            datetime.utcnow().isoformat(),
+            action,
+            filename,
+            doc_id,
+            status,
+            float(duration_ms),
+            int(file_size) if file_size is not None else None,
+            file_hash,
+            json.dumps(details or {}, ensure_ascii=False),
+        ),
+    )
     conn.commit()
     conn.close()
 
 
 # ==========================
-# 5) File hashing + scanning
+# 5) Text extraction (bytes)
 # ==========================
 
-def compute_file_hash(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def list_data_files() -> List[Tuple[str, str]]:
-    """
-    Return list of (absolute_path, doc_type) for all supported files inside data folders.
-    doc_type in {"pdf","txt","html"}
-    """
-    files: List[Tuple[str, str]] = []
-
-    os.makedirs(PDF_DIR, exist_ok=True)
-    os.makedirs(TEXT_DIR, exist_ok=True)
-    os.makedirs(HTML_DIR, exist_ok=True)
-
-    for name in os.listdir(PDF_DIR):
-        if name.lower().endswith(".pdf"):
-            files.append((os.path.join(PDF_DIR, name), "pdf"))
-
-    for name in os.listdir(TEXT_DIR):
-        if name.lower().endswith(".txt"):
-            files.append((os.path.join(TEXT_DIR, name), "txt"))
-
-    for name in os.listdir(HTML_DIR):
-        if name.lower().endswith(".html") or name.lower().endswith(".htm"):
-            files.append((os.path.join(HTML_DIR, name), "html"))
-
-    return files
-
-
-# ==========================
-# 6) Extractors
-# ==========================
-
-def extract_text_from_pdf(abs_path: str, max_pages: int = 999) -> str:
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 999) -> str:
     texte = ""
-    with open(abs_path, "rb") as f:
-        reader = PdfReader(f)
-        n_pages = min(len(reader.pages), max_pages)
-        for i in range(n_pages):
-            texte += "\n" + (reader.pages[i].extract_text() or "")
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    n_pages = min(len(reader.pages), max_pages)
+    for i in range(n_pages):
+        texte += "\n" + (reader.pages[i].extract_text() or "")
     return texte.strip()
 
-def extract_text_from_txt(abs_path: str) -> str:
-    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read().strip()
 
-def extract_text_from_html(abs_path: str) -> str:
-    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-        html_content = f.read()
-    soup = BeautifulSoup(html_content, "html.parser")
+def extract_text_from_txt_bytes(txt_bytes: bytes) -> str:
+    try:
+        return txt_bytes.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return txt_bytes.decode("latin-1", errors="ignore").strip()
+
+
+def extract_text_from_html_bytes(html_bytes: bytes) -> str:
+    raw = extract_text_from_txt_bytes(html_bytes)
+    if BeautifulSoup is None:
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = re.sub(r"\s+", " ", raw)
+        return raw.strip()
+
+    soup = BeautifulSoup(raw, "html.parser")
     for element in soup(["script", "style", "header", "footer", "nav", "form"]):
         element.decompose()
-    texte = soup.get_text()
+    texte = soup.get_text(separator="\n")
     texte = "\n".join([line.strip() for line in texte.splitlines() if line.strip()])
     texte = re.sub(r"\s+", " ", texte)
     return texte.strip()
+
 
 def enlever_references(texte: str) -> str:
     if not texte:
@@ -318,6 +450,7 @@ def enlever_references(texte: str) -> str:
             last_pos = max(last_pos, m.start())
     return texte[:last_pos] if last_pos != -1 else texte
 
+
 def nettoyer_texte(texte: str) -> str:
     if not texte:
         return ""
@@ -328,8 +461,22 @@ def nettoyer_texte(texte: str) -> str:
     return ptd.strip()
 
 
+def extract_clean_text_from_bytes(file_bytes: bytes, doc_type: str) -> str:
+    if doc_type == "pdf":
+        raw = extract_text_from_pdf_bytes(file_bytes)
+    elif doc_type == "html":
+        raw = extract_text_from_html_bytes(file_bytes)
+    else:
+        raw = extract_text_from_txt_bytes(file_bytes)
+
+    if not raw:
+        raise ValueError("Empty extracted text")
+
+    return nettoyer_texte(enlever_references(raw))
+
+
 # ==========================
-# 7) Tokenization / Lemmatization
+# 6) Tokenization / Lemmatization
 # ==========================
 
 def pos_tag_to_wordnet(tag: str):
@@ -347,8 +494,13 @@ def pos_tag_to_wordnet(tag: str):
     except Exception:
         return "n"
 
-def preprocess_and_lemmatize(text: str, language: str = "english",
-                             remove_stopwords: bool = True, min_len: int = 3) -> List[str]:
+
+def preprocess_and_lemmatize(
+    text: str,
+    language: str = "english",
+    remove_stopwords: bool = True,
+    min_len: int = 3,
+) -> List[str]:
     if not text:
         return []
 
@@ -382,6 +534,7 @@ def preprocess_and_lemmatize(text: str, language: str = "english",
             out.append(lemma)
     return out
 
+
 def tokenize_to_ngrams_lemm(text: str, n: int = 1, min_len: int = 3) -> Dict[str, int]:
     tokens = preprocess_and_lemmatize(text, min_len=min_len)
     counts = defaultdict(int)
@@ -394,14 +547,17 @@ def tokenize_to_ngrams_lemm(text: str, n: int = 1, min_len: int = 3) -> Dict[str
 
 
 # ==========================
-# 8) BM25
+# 7) BM25
 # ==========================
 
 class SimpleBM25:
     def __init__(self, corpus_term_counts: List[Dict[str, int]], k1=1.5, b=0.75):
         self.corpus = corpus_term_counts
         self.N = len(corpus_term_counts)
-        self.avgdl = sum(sum(d.values()) for d in corpus_term_counts) / max(1, self.N)
+        self.avgdl = (
+            sum(sum(d.values()) for d in corpus_term_counts) / max(1, self.N)
+            if self.N > 0 else 0.0
+        )
         self.k1 = k1
         self.b = b
         self.df = defaultdict(int)
@@ -424,68 +580,55 @@ class SimpleBM25:
                 continue
             df_q = self.df.get(q, 0)
             idf = log((self.N - df_q + 0.5) / (df_q + 0.5) + 1.0)
-            denom = f + self.k1 * (1 - self.b + self.b * dl / max(1, self.avgdl))
+            denom = f + self.k1 * (1 - self.b + self.b * dl / max(1e-9, self.avgdl))
             score += idf * (f * (self.k1 + 1)) / denom
 
         return float(score)
 
+
 _bm25_model: Optional[SimpleBM25] = None
+
 
 def reset_bm25_cache():
     global _bm25_model
     _bm25_model = None
+
 
 def get_bm25_model(db_path: str = DB_PATH) -> SimpleBM25:
     global _bm25_model
     if _bm25_model is not None:
         return _bm25_model
 
+    init_db_enhanced(db_path)
+
     conn = connect_db(db_path)
     cur = conn.cursor()
-    try:
-        cur.execute("SELECT doc_id, clean_text FROM documents ORDER BY doc_id")
-        docs = cur.fetchall()
-    except sqlite3.OperationalError:
-        docs = []
+    cur.execute("SELECT doc_id, clean_text FROM documents ORDER BY doc_id")
+    docs = cur.fetchall()
     conn.close()
 
-    corpus_counts = []
-    for _, clean_text in docs:
-        corpus_counts.append(tokenize_to_ngrams_lemm(clean_text, n=1))
-
-    _bm25_model = SimpleBM25(corpus_counts) if corpus_counts else SimpleBM25([])
+    corpus_counts = [tokenize_to_ngrams_lemm(clean_text or "", n=1) for _, clean_text in docs]
+    _bm25_model = SimpleBM25(corpus_counts)
     return _bm25_model
 
 
 # ==========================
-# 9) Embeddings store (.npz) incremental
+# 8) Embeddings store (.npz)
 # ==========================
 
 def load_embeddings_map(path: str) -> Dict[str, "np.ndarray"]:
     if np is None or not os.path.exists(path):
         return {}
-    data = np.load(path)
-    return {k: data[k] for k in data.files}
-
-def save_embeddings_map(emb_map: Dict[str, List[float]], path: str):
-    if np is None:
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez_compressed(path, **{k: np.array(v, dtype=np.float32) for k, v in emb_map.items()})
+    try:
+        data = np.load(path, allow_pickle=False)
+        return {k: data[k] for k in data.files}
+    except Exception:
+        return {}
 
 
 # ==========================
-# 10) Incremental indexing (core)
+# 9) Delete doc (DB only)
 # ==========================
-
-def extract_by_type(abs_path: str, doc_type: str) -> str:
-    if doc_type == "pdf":
-        return extract_text_from_pdf(abs_path)
-    if doc_type == "txt":
-        return extract_text_from_txt(abs_path)
-    if doc_type == "html":
-        return extract_text_from_html(abs_path)
-    raise ValueError(f"Unsupported doc_type: {doc_type}")
 
 def delete_document_everything(doc_id: str, db_path: str = DB_PATH):
     conn = connect_db(db_path)
@@ -496,80 +639,71 @@ def delete_document_everything(doc_id: str, db_path: str = DB_PATH):
     conn.commit()
     conn.close()
 
-def upsert_document_index(
-    abs_path: str,
+
+# ==========================
+# 10) Index from MinIO (PDF/TXT/HTML)
+# ==========================
+
+def upsert_document_index_from_minio(
+    doc_id: str,
+    filename: str,
     doc_type: str,
+    object_key: str,
     embed_path: str = DEFAULT_EMBED_PATH,
     compute_embeddings: bool = True,
-    db_path: str = DB_PATH
+    db_path: str = DB_PATH,
 ):
-    filename = os.path.basename(abs_path)
     start = time.perf_counter()
+    init_db_enhanced(db_path)
 
     try:
-        file_size = os.path.getsize(abs_path)
-        file_hash = compute_file_hash(abs_path)
+        file_bytes = get_object_bytes(object_key)
+        file_size = len(file_bytes)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-        init_db_enhanced(db_path)
-
-        # check existing
         conn = connect_db(db_path)
         cur = conn.cursor()
-        cur.execute("SELECT doc_id, file_hash FROM documents WHERE filename = ?", (filename,))
+        cur.execute("SELECT file_hash FROM documents WHERE doc_id = ?", (doc_id,))
         row = cur.fetchone()
         conn.close()
 
-        if row:
-            existing_doc_id, existing_hash = row
-            if existing_hash == file_hash:
-                # unchanged -> nothing
-                return {"action": "SKIP", "filename": filename, "doc_id": existing_doc_id}
+        if row and row[0] == file_hash:
+            return {"action": "SKIP", "filename": filename, "doc_id": doc_id}
 
-            # modified -> delete old then reinsert
-            delete_document_everything(existing_doc_id, db_path=db_path)
-            action = "UPDATE"
-            doc_id = existing_doc_id
-        else:
-            action = "INSERT"
-            doc_id = str(uuid.uuid4())
+        action = "UPDATE" if row else "INSERT"
 
-        raw_text = extract_by_type(abs_path, doc_type)
-        if not raw_text:
-            raise ValueError("Empty extracted text")
+        clean_text = extract_clean_text_from_bytes(file_bytes, doc_type)
 
-        clean_text = nettoyer_texte(enlever_references(raw_text))
-
-        # write documents + postings + meta
         conn = connect_db(db_path)
         cur = conn.cursor()
-
         now = datetime.utcnow().isoformat()
 
-        cur.execute("""
-            INSERT OR REPLACE INTO documents(doc_id, filename, doc_type, clean_text, file_hash, file_size, added_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT added_at FROM documents WHERE doc_id = ?), ?), ?)
-        """, (doc_id, filename, doc_type, clean_text, file_hash, file_size, doc_id, now, now))
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO documents(doc_id, filename, doc_type, clean_text, file_hash, file_size, object_key, added_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT added_at FROM documents WHERE doc_id = ?), ?), ?)
+            """,
+            (doc_id, filename, doc_type, clean_text, file_hash, file_size, object_key, doc_id, now, now),
+        )
 
-        # postings insert
-        # bigrams
+        cur.execute("DELETE FROM postings WHERE doc_id = ?", (doc_id,))
+
         bigram_counts = tokenize_to_ngrams_lemm(clean_text, n=2)
         m = max(bigram_counts.values()) if bigram_counts else 1
         for term, count in bigram_counts.items():
             cur.execute(
                 "INSERT INTO postings(doc_id, term, n, algo, score) VALUES (?, ?, ?, ?, ?)",
-                (doc_id, term, 2, "n_gram_lemm", float(count / m))
+                (doc_id, term, 2, "n_gram_lemm", float(count / m)),
             )
 
-        # unigrams
         unigram_counts = tokenize_to_ngrams_lemm(clean_text, n=1)
         mu = max(unigram_counts.values()) if unigram_counts else 1
         for term, count in unigram_counts.items():
             cur.execute(
                 "INSERT INTO postings(doc_id, term, n, algo, score) VALUES (?, ?, ?, ?, ?)",
-                (doc_id, term, 1, "mots_lemm", float(count / mu))
+                (doc_id, term, 1, "mots_lemm", float(count / mu)),
             )
 
-        # embeddings incremental
         has_emb = 0
         if compute_embeddings and SentenceTransformer is not None and np is not None:
             try:
@@ -580,7 +714,7 @@ def upsert_document_index(
 
                 existing = load_embeddings_map(embed_path)
                 existing[doc_id] = vec.astype(np.float32)
-                # rewrite whole npz (simple & safe)
+                os.makedirs(os.path.dirname(embed_path), exist_ok=True)
                 np.savez_compressed(embed_path, **existing)
             except Exception as e:
                 logger.warning("Embedding failed for %s: %s", filename, e)
@@ -590,7 +724,6 @@ def upsert_document_index(
         conn.commit()
         conn.close()
 
-        # invalidate BM25 cache
         reset_bm25_cache()
 
         dur = (time.perf_counter() - start) * 1000.0
@@ -602,7 +735,12 @@ def upsert_document_index(
             duration_ms=dur,
             file_size=file_size,
             file_hash=file_hash,
-            details={"doc_type": doc_type, "unigrams": len(unigram_counts), "bigrams": len(bigram_counts)}
+            details={
+                "doc_type": doc_type,
+                "unigrams": len(unigram_counts),
+                "bigrams": len(bigram_counts),
+                "object_key": object_key,
+            },
         )
 
         return {"action": action, "filename": filename, "doc_id": doc_id, "duration_ms": dur}
@@ -611,59 +749,30 @@ def upsert_document_index(
         dur = (time.perf_counter() - start) * 1000.0
         log_update(
             action="ERROR",
-            filename=os.path.basename(abs_path),
-            doc_id=None,
+            filename=filename,
+            doc_id=doc_id,
             status="FAIL",
             duration_ms=dur,
-            details={"error": str(e), "path": abs_path, "doc_type": doc_type}
+            details={"error": str(e), "object_key": object_key, "doc_type": doc_type},
         )
         raise
 
 
-def index_new_or_modified_documents(
+# ==========================
+# 11) Ensure index (no local scan)
+# ==========================
+
+def ensure_index_built_enhanced(
     embed_path: str = DEFAULT_EMBED_PATH,
     compute_embeddings: bool = True,
-    db_path: str = DB_PATH
+    db_path: str = DB_PATH,
 ) -> Dict[str, int]:
-    """
-    Scan data folders and index only new/changed files.
-    Return counts.
-    """
     init_db_enhanced(db_path)
-    files = list_data_files()
-
-    inserted = 0
-    updated = 0
-    skipped = 0
-
-    for abs_path, doc_type in files:
-        res = upsert_document_index(
-            abs_path=abs_path,
-            doc_type=doc_type,
-            embed_path=embed_path,
-            compute_embeddings=compute_embeddings,
-            db_path=db_path
-        )
-        if res["action"] == "INSERT":
-            inserted += 1
-        elif res["action"] == "UPDATE":
-            updated += 1
-        elif res["action"] == "SKIP":
-            skipped += 1
-
-    return {"inserted": inserted, "updated": updated, "skipped": skipped}
-
-
-def ensure_index_built_enhanced(embed_path: str = DEFAULT_EMBED_PATH, compute_embeddings: bool = True):
-    """
-    Ensure schema exists and do an incremental indexing pass.
-    """
-    init_db_enhanced(DB_PATH)
-    return index_new_or_modified_documents(embed_path=embed_path, compute_embeddings=compute_embeddings, db_path=DB_PATH)
+    return {"inserted": 0, "updated": 0, "skipped": 0}
 
 
 # ==========================
-# 11) Search (using cached BM25)
+# 12) Search
 # ==========================
 
 def fuzzy_score(a: str, b: str) -> float:
@@ -677,6 +786,7 @@ def fuzzy_score(a: str, b: str) -> float:
     import difflib
     return difflib.SequenceMatcher(None, a, b).ratio()
 
+
 def search_db_enhanced(
     query: str,
     db_path: str = DB_PATH,
@@ -688,8 +798,10 @@ def search_db_enhanced(
     w_semantic: float = 1.0,
     embed_path: str = DEFAULT_EMBED_PATH,
     use_semantic: bool = True,
-    fuzzy_threshold: float = 0.6
+    fuzzy_threshold: float = 0.6,
 ):
+    init_db_enhanced(db_path)
+
     unigrams = preprocess_and_lemmatize(query)
     bigrams = [" ".join(bg) for bg in ngrams(unigrams, 2)] if len(unigrams) >= 2 else []
 
@@ -702,7 +814,6 @@ def search_db_enhanced(
     scores_docs = defaultdict(float)
     doc_hits = defaultdict(lambda: {"match_terms": set()})
 
-    # 1) exact matches
     if unigrams:
         placeholders = ",".join(["?"] * len(unigrams))
         sql = f"""
@@ -725,7 +836,6 @@ def search_db_enhanced(
             scores_docs[doc_id] += float(score) * w_bigram
             doc_hits[doc_id]["match_terms"].add(term)
 
-    # 2) fuzzy
     if fuzz is not None:
         cur.execute("SELECT DISTINCT term FROM postings")
         all_terms = [r[0] for r in cur.fetchall()]
@@ -745,7 +855,6 @@ def search_db_enhanced(
                     scores_docs[doc_id] += float(score) * w_fuzzy * best_score
                     doc_hits[doc_id]["match_terms"].add(f"{best_term} (fuzzy:{best_score:.2f})")
 
-    # 3) docs order stable
     cur.execute("SELECT doc_id, clean_text FROM documents ORDER BY doc_id")
     docs = cur.fetchall()
     docid_to_index = {doc_id: i for i, (doc_id, _) in enumerate(docs)}
@@ -756,24 +865,22 @@ def search_db_enhanced(
         if s:
             scores_docs[doc_id] += float(s) * w_bm25
 
-    # 4) semantic (optional)
     if use_semantic and SentenceTransformer is not None and np is not None and st_util is not None:
         emb_map = load_embeddings_map(embed_path)
         model = get_embedding_model()
         if model:
             try:
-                q_emb = model.encode(query, convert_to_tensor=True)
-                q_vec = q_emb.cpu().numpy()
-                q_norm = np.linalg.norm(q_vec) + 1e-12
+                q_vec = model.encode(query)
+                q_norm = float(np.linalg.norm(q_vec) + 1e-12)
             except Exception:
                 q_vec, q_norm = None, None
 
             if q_vec is not None:
-                for doc_id, clean_text in docs:
+                for doc_id, _ in docs:
                     sim_norm = 0.0
                     if doc_id in emb_map:
                         d_vec = np.array(emb_map[doc_id])
-                        d_norm = np.linalg.norm(d_vec) + 1e-12
+                        d_norm = float(np.linalg.norm(d_vec) + 1e-12)
                         sim = float(np.dot(q_vec, d_vec) / (q_norm * d_norm))
                         sim_norm = (sim + 1.0) / 2.0
                     scores_docs[doc_id] += sim_norm * w_semantic
@@ -792,24 +899,19 @@ def search_db_enhanced(
             continue
         filename, doc_type, clean_text = row
         snippet = (clean_text[:300] + "...") if clean_text else ""
+        url = f"/files/{doc_id}"
 
-        if doc_type == "pdf":
-            url = f"/pdfs/{filename}"
-        elif doc_type == "txt":
-            url = f"/texts/{filename}"
-        elif doc_type == "html":
-            url = f"/htmls/{filename}"
-        else:
-            url = None
-
-        results.append({
-            "doc_id": doc_id,
-            "filename": filename,
-            "score": float(score),
-            "snippet": snippet,
-            "match_terms": sorted(list(doc_hits[doc_id]["match_terms"])) if doc_id in doc_hits else [],
-            "pdf_url": url
-        })
+        results.append(
+            {
+                "doc_id": doc_id,
+                "filename": filename,
+                "score": float(score),
+                "snippet": snippet,
+                "match_terms": sorted(list(doc_hits[doc_id]["match_terms"])) if doc_id in doc_hits else [],
+                "pdf_url": url,
+                "doc_type": doc_type,
+            }
+        )
 
     conn.close()
     return results

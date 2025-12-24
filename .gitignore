@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+backend/data/logs/
+
+# Local data artifacts
+*.db
+*.npz
+backend/data/*.db
+backend/data/*.npz
+backend/data/pdfs/

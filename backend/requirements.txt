@@ -13,4 +13,5 @@ scipy
 watchdog
 portalocker
 psutil
-matplotlib
+prometheus_client
+boto3

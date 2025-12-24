@@ -1,16 +1,13 @@
-// frontend/src/api.js
+export const API_BASE_URL = "/api";
 
-export const API_BASE_URL = "http://localhost:8000";
-
-export async function searchDocs(query, topK = 5) {
+export async function searchDocs(query, topK = 5, useSemantic = true) {
   const params = new URLSearchParams({
     query,
-    top_k: topK.toString(),
+    top_k: String(topK),
+    use_semantic: useSemantic ? "true" : "false",
   });
 
-  const res = await fetch(`${API_BASE_URL}/search?` + params.toString());
-  if (!res.ok) {
-    throw new Error(`Erreur API: ${res.status}`);
-  }
-  return await res.json();
+  const res = await fetch(`${API_BASE_URL}/search?${params.toString()}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }

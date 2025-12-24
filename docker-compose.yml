@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: search-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - minio_data:/data
+
+  backend:
+    build: ./backend
+    container_name: search-backend
+    expose:
+      - "8000"
+    volumes:
+      - ./backend/data:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+      # Interne Docker
+      MINIO_ENDPOINT: "http://minio:9000"
+
+      # Public navigateur (host machine)
+      MINIO_PUBLIC_ENDPOINT: "http://localhost:9100"
+
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "documents"
+      MINIO_REGION: "us-east-1"
+    depends_on:
+      - minio
+
+  frontend:
+    build: ./frontend
+    container_name: search-frontend
+    expose:
+      - "80"
+
+  gateway:
+    image: nginx:alpine
+    container_name: search-gateway
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - frontend
+      - backend
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: search-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: search-grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  minio_data:
+  grafana_data:
